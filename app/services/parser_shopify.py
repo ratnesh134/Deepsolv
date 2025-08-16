@@ -1,35 +1,22 @@
-# app/services/parser_shopify.py
-import json
-import re
-import asyncio
+import json, re, asyncio
 from typing import List, Dict, Optional, Tuple
 from bs4 import BeautifulSoup
-
 from app.services.fetcher import Fetcher
 from app.services.html_utils import (
-    soupify,
-    find_links,
-    absolutize,
-    extract_emails_phones,
-    extract_socials,
-    extract_jsonld_faqs,
-    extract_brand_name,
+    soupify, find_links, absolutize, extract_emails_phones,
+    extract_socials, extract_jsonld_faqs, extract_brand_name
 )
 from app.services.normalizer import clean_text, unique_keep_order
-from app.services.llm_groq import call_groq_llm, GroqLLMError
 from app.config import settings
 from app.models.schemas import (
-    Product,
-    Policy,
-    FAQItem,
-    SocialHandles,
-    ContactInfo,
-    ImportantLinks,
-    BrandContext,
+    Product, Policy, FAQItem, SocialHandles, ContactInfo,
+    ImportantLinks, BrandContext
 )
-from app.exceptions import ParsingError
 
-# Constants / heuristics (kept for pre-fetching and link discovery)
+POLICY_KEYWORDS = {
+    "privacy": ["privacy", "privacy-policy"],
+    "refund": ["return", "refund", "returns", "return-policy", "refund-policy"],
+}
 COMMON_POLICY_ROUTES = [
     "/policies/privacy-policy",
     "/policies/refund-policy",
@@ -37,19 +24,17 @@ COMMON_POLICY_ROUTES = [
 ]
 
 FAQ_HINTS = ["faq", "faqs", "help", "support"]
-ABOUT_HINTS = ["about", "our story", "about us", "about-us"]
-TRACK_HINTS = ["track", "order tracking", "track order", "track-order"]
+ABOUT_HINTS = ["about", "our story", "about us"]
+TRACK_HINTS = ["track", "order tracking", "track order"]
 BLOG_HINTS = ["blog", "blogs", "journal"]
-CONTACT_HINTS = ["contact", "contact us", "support", "customer service"]
+CONTACT_HINTS = ["contact", "contact us", "support"]
 
 PRODUCT_LINK_PAT = re.compile(r"/products/[^/]+/?$", re.I)
-PHONE_STRICT = re.compile(r"^\+\d{1,3}-\d{7,15}$")  # final strict pattern: +CC-NUMBER
-
 
 class ShopifyParser:
     def __init__(self, fetcher: Fetcher, base_url: str):
         self.fetcher = fetcher
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url
 
     async def fetch_homepage(self) -> Tuple[Optional[str], BeautifulSoup]:
         status, html = await self.fetcher.get_text(self.base_url)
@@ -57,7 +42,7 @@ class ShopifyParser:
         return (html, soup)
 
     async def fetch_products_json(self) -> List[Dict]:
-        """Fetch products.json across pages with safe caps (uses settings)."""
+        # /products.json?limit=250&page=1..N
         all_products = []
         for page in range(1, settings.MAX_PRODUCTS_PAGES + 1):
             url = f"{self.base_url}/products.json?limit={settings.MAX_PRODUCTS_PAGE_LIMIT}&page={page}"
@@ -73,13 +58,11 @@ class ShopifyParser:
                 if len(items) < settings.MAX_PRODUCTS_PAGE_LIMIT:
                     break
             except json.JSONDecodeError:
-                # stop on invalid json
                 break
         return all_products
 
     @staticmethod
     def _map_products(raw: List[Dict]) -> List[Product]:
-        """Local mapping fallback: maps raw Shopify product dicts to Product Pydantic objects."""
         products = []
         for p in raw:
             images = [img.get("src") for img in (p.get("images") or []) if img.get("src")]
@@ -93,23 +76,23 @@ class ShopifyParser:
                         price_range = f"{floats[0]:.2f}"
                     else:
                         price_range = f"{floats[0]:.2f}-{floats[-1]:.2f}"
-                except Exception:
+                except:
                     price_range = None
+            url = None
             handle = p.get("handle")
-            url = f"/products/{handle}" if handle else None
-            products.append(
-                Product(
-                    id=p.get("id"),
-                    title=p.get("title"),
-                    handle=handle,
-                    product_type=p.get("product_type"),
-                    vendor=p.get("vendor"),
-                    tags=[t.strip() for t in (p.get("tags", "").split(",") if isinstance(p.get("tags"), str) else p.get("tags") or []) if t.strip()],
-                    url=url,
-                    images=images,
-                    price_range=price_range,
-                )
-            )
+            if handle:
+                url = f"/products/{handle}"
+            products.append(Product(
+                id=p.get("id"),
+                title=p.get("title"),
+                handle=handle,
+                product_type=p.get("product_type"),
+                vendor=p.get("vendor"),
+                tags=[t.strip() for t in (p.get("tags","").split(",") if isinstance(p.get("tags"), str) else p.get("tags") or []) if t.strip()],
+                url=url,
+                images=images,
+                price_range=price_range
+            ))
         return products
 
     def _extract_hero_products(self, soup: BeautifulSoup) -> List[Product]:
@@ -119,7 +102,7 @@ class ShopifyParser:
             if PRODUCT_LINK_PAT.search(href):
                 title = a.get_text(strip=True) or None
                 prods.append(Product(title=title, url=href))
-        # dedupe by url
+        # unique by url
         seen = set()
         uniq = []
         for p in prods:
@@ -127,7 +110,7 @@ class ShopifyParser:
             if key and key not in seen:
                 uniq.append(p)
                 seen.add(key)
-        return uniq[:20]
+        return uniq[:20]  # sanity cap
 
     async def _fetch_policy(self, url: str, name: str) -> Optional[Policy]:
         status, text = await self.fetcher.get_text(url)
@@ -139,123 +122,119 @@ class ShopifyParser:
         return Policy(title=name.title().replace("_", " "), url=url, content_text=clean_text(content)[:2000])
 
     async def extract(self) -> BrandContext:
-        """
-        Main extraction pipeline:
-         - fetch homepage, products.json
-         - gather small set of discovered links (footer/nav) to help the LLM
-         - call LLM to produce final structured BrandContext JSON
-         - validate with Pydantic and enforce strict phone formatting
-        """
-        # 1) fetch homepage + products json
         html, soup = await self.fetch_homepage()
-        raw_products = await self.fetch_products_json()
 
-        # 2) basic heuristics for discovered links to feed LLM
+        brand_name = extract_brand_name(soup)
+
+        # Important links and pages
         link_map = find_links(
             soup,
             keywords=list({*FAQ_HINTS, *ABOUT_HINTS, *TRACK_HINTS, *BLOG_HINTS, *CONTACT_HINTS, "privacy", "return", "refund"})
         )
+        def pick_url(keys: List[str]) -> Optional[str]:
+            for k in keys:
+                if k in link_map:
+                    return link_map[k]
+            return None
 
-        # Build a small discovered_links list (absolutized)
-        discovered_links = []
-        for k, v in link_map.items():
-            if v:
-                discovered_links.append(absolutize(self.base_url, v))
-        # include common policy routes as candidate probes (absolute)
-        for route in COMMON_POLICY_ROUTES:
-            discovered_links.append(self.base_url + route)
-        # unique
-        discovered_links = unique_keep_order(discovered_links)[:20]
+        important = ImportantLinks(
+            faq=pick_url(FAQ_HINTS),
+            about=pick_url(ABOUT_HINTS),
+            order_tracking=pick_url(TRACK_HINTS),
+            blog=pick_url(BLOG_HINTS),
+            contact_us=pick_url(CONTACT_HINTS),
+        )
 
-        # 3) build system / user prompts for the LLM
-        # truncate HTML to safe size to keep tokens reasonable
-        homepage_snippet = (html or "")[:30000]
-        # Trim products to a reasonable count in prompt
-        sample_products = raw_products[:300]  # adjust if needed
+        # Normalize/absolutize known policy links or probe common policy routes
+        privacy_url = important.privacy or None
+        refund_url = important.returns or None
 
-        system_prompt = """
-You are a data extraction assistant. You will be given:
-- homepage_html: raw HTML string of the homepage,
-- products_json: an array of product objects from Shopify's /products.json,
-- discovered_links: helpful absolute links (faq, about, policies, etc.),
-- base_url: the store's base url.
+        if not privacy_url:
+            for route in COMMON_POLICY_ROUTES:
+                if "privacy" in route:
+                    privacy_url = route
+                    break
+        if not refund_url:
+            for route in COMMON_POLICY_ROUTES:
+                if "refund" in route or "return" in route:
+                    refund_url = route
+                    break
 
-Your job: extract and normalize the store's information into a strict JSON object following this schema exactly:
+        if privacy_url:
+            privacy_url = absolutize(self.base_url, privacy_url)
+        if refund_url:
+            refund_url = absolutize(self.base_url, refund_url)
 
-{
-  "website_url": "<string>",
-  "brand_name": "<string|null>",
-  "hero_products": [ { "title": "<string|null>", "handle": "<string|null>", "url": "<string|null>", "images": ["..."], "price_range": "<string|null>" } ],
-  "product_catalog": [ { "id": int|null, "title": "<string|null>", "handle": "<string|null>", "product_type": "<string|null>", "vendor":"<string|null>", "tags":[...], "url":"<string|null>", "images":[...], "price_range":"<string|null>" } ],
-  "privacy_policy": { "title":"<string>", "url":"<string|null>", "content_text":"<string|null>" } | null,
-  "return_refund_policy": { "title":"<string>", "url":"<string|null>", "content_text":"<string|null>" } | null,
-  "faqs": [ { "question":"<string>", "answer":"<string>" } ],
-  "social_handles": { "instagram":"<string|null>", "facebook":"<string|null>", "tiktok":"<string|null>", "twitter":"<string|null>", "youtube":"<string|null>", "pinterest":"<string|null>", "linkedin":"<string|null>" },
-  "contact_info": { "emails":[...], "phones":[...] },
-  "about_text": "<string|null>",
-  "important_links": { "order_tracking":"<string|null>", "contact_us":"<string|null>", "blog":"<string|null>", "privacy":"<string|null>", "returns":"<string|null>", "faq":"<string|null>", "about":"<string|null>" },
-  "raw_meta": {}
-}
+        # Gather contacts/socials from homepage html
+        emails, phones = extract_emails_phones(html or "")
+        socials = extract_socials(html or "")
 
-IMPORTANT RULES:
-1) Return ONLY valid JSON (no surrounding commentary).
-2) Phone numbers must strictly follow the format: +<country_code>-<number> (dash required). Country code 1-3 digits; number 7-15 digits. If you cannot produce this normalized form for a phone, omit it.
-3) Keep text trimmed. Limit policy content_text and about_text to 2000 characters.
-4) If a field is not found, use null or an empty list as appropriate.
-5) Prefer absolute URLs where possible.
-6) For product_catalog, include as many products as available but if there are many, return at most 1000 entries in the JSON output.
-"""
+        # Try about text
+        about_text = None
+        if important.about:
+            status, txt = await self.fetcher.get_text(absolutize(self.base_url, important.about))
+            if txt and status < 400:
+                s2 = soupify(txt)
+                main = s2.find("main") or s2
+                about_text = clean_text(main.get_text(" ", strip=True))[:2000]
 
-        # Compose a user prompt containing the inputs (JSON-encoded)
-        user_prompt = f"""
-homepage_html: '''{homepage_snippet}'''
-products_json: {json.dumps(sample_products, ensure_ascii=False)}
-discovered_links: {json.dumps(discovered_links)}
-base_url: {self.base_url}
+        # FAQs: json-ld or explicit FAQ page
+        faqs = []
+        faqs.extend([FAQItem(**x) for x in extract_jsonld_faqs(soup)])
+        if not faqs and important.faq:
+            status, txt = await self.fetcher.get_text(absolutize(self.base_url, important.faq))
+            if txt and status < 400:
+                s3 = soupify(txt)
+                faqs.extend([FAQItem(**x) for x in extract_jsonld_faqs(s3)])
+                # fallback: simplistic Q/A extraction
+                if not faqs:
+                    qa = []
+                    for el in s3.select("h2,h3"):
+                        q = el.get_text(" ", strip=True)
+                        nxt = el.find_next_sibling()
+                        if q and nxt:
+                            a = nxt.get_text(" ", strip=True)
+                            if a:
+                                qa.append(FAQItem(question=q, answer=a[:600]))
+                    faqs = qa[:20]
 
-Produce the JSON matching the schema exactly. Output ONLY the JSON.
-"""
+        # Policies contents
+        privacy_policy = await self._fetch_policy(privacy_url, "privacy_policy") if privacy_url else None
+        return_policy  = await self._fetch_policy(refund_url,  "return_refund_policy") if refund_url else None
 
-        # 4) Call LLM in a thread (call_groq_llm is blocking)
-        try:
-            structured = await asyncio.get_event_loop().run_in_executor(
-                None, call_groq_llm, system_prompt, user_prompt, 0.0
-            )
-        except GroqLLMError as e:
-            raise ParsingError(f"LLM extraction failed: {e}")
-        except Exception as e:
-            raise ParsingError(f"Unexpected LLM error: {e}")
+        # Product catalog via products.json
+        raw_products = await self.fetch_products_json()
+        catalog = self._map_products(raw_products)
 
-        if not isinstance(structured, dict):
-            raise ParsingError("LLM did not return a JSON object as expected.")
+        # Hero products (homepage links)
+        hero = self._extract_hero_products(soup)
 
-        # 5) Validate & coerce to Pydantic BrandContext
-        try:
-            ctx = BrandContext.model_validate(structured)
-        except Exception as e:
-            # include a short dump of structured for debugging (but not too large)
-            s = json.dumps(structured)[:2000]
-            raise ParsingError(f"LLM returned invalid schema: {e}. Partial output: {s}")
+        # Fill important links with absolutized values if present
+        def abs_or_none(u): return absolutize(self.base_url, u) if u else None
+        important.privacy = privacy_policy.url if privacy_policy else abs_or_none(link_map.get("privacy"))
+        important.returns = return_policy.url if return_policy else abs_or_none(link_map.get("return") or link_map.get("refund"))
+        important.faq = abs_or_none(important.faq) if important.faq else None
+        important.about = abs_or_none(important.about) if important.about else None
+        important.blog = abs_or_none(important.blog) if important.blog else None
+        important.order_tracking = abs_or_none(important.order_tracking) if important.order_tracking else None
+        important.contact_us = abs_or_none(important.contact_us) if important.contact_us else None
 
-        # 6) Final enforcement: strict phone pattern (as safety net)
-        try:
-            phones_raw = ctx.contact_info.phones or []
-            phones_clean = [p for p in phones_raw if isinstance(p, str) and PHONE_STRICT.match(p)]
-            # Update the model instance field
-            ctx.contact_info.phones = phones_clean
-        except Exception:
-            # If something unexpected, just clear phones to be safe
-            ctx.contact_info.phones = []
+        # Dedup & finalize
+        emails = unique_keep_order(emails)
+        phones = unique_keep_order(phones)
 
-        # 7) Ensure important_links are absolute where present (best effort)
-        try:
-            il = ctx.important_links
-            for attr in ["order_tracking", "contact_us", "blog", "privacy", "returns", "faq", "about"]:
-                val = getattr(il, attr, None)
-                if val:
-                    setattr(il, attr, absolutize(self.base_url, val))
-        except Exception:
-            pass
-
-        # 8) Done
+        ctx = BrandContext(
+            website_url=self.base_url,
+            brand_name=brand_name,
+            hero_products=hero,
+            product_catalog=catalog,
+            privacy_policy=privacy_policy,
+            return_refund_policy=return_policy,
+            faqs=faqs,
+            social_handles=SocialHandles(**socials),
+            contact_info=ContactInfo(emails=emails, phones=phones),
+            about_text=about_text,
+            important_links=important,
+            raw_meta={}
+        )
         return ctx
