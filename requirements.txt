@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+httpx
+beautifulsoup4
+lxml
+pydantic
+pydantic-settings
+python-dotenv
+SQLAlchemy
+tldextract
+streamlit
+requests
+pandas

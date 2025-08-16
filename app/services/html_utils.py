@@ -46,21 +46,22 @@ def absolutize(base: str, href: str) -> str:
     return base.rstrip("/") + href
 
 def extract_emails_phones(text: str) -> Tuple[List[str], List[str]]:
-    # Extract emails
+    # Extract emails (unchanged)
     emails = sorted(set(m.group(0) for m in EMAIL_RE.finditer(text)))
     
     # Extract raw phone numbers
     raw_phones = sorted(set(m.group(0) for m in PHONE_RE.finditer(text)))
     
-    # Clean phone numbers
+    # Only keep numbers starting with +<country_code>-<number>
     cleaned_phones = []
     for num in raw_phones:
-        num_str = re.sub(r"[^\d+]", "", num)  # Remove spaces, hyphens, non-digits except '+'
-        if re.fullmatch(r"\+?\d{10}", num_str):  # Acceptable phone number length
+        num_str = re.sub(r"[^\d+-]", "", num)  # Keep digits, '+' and '-'
+        if re.fullmatch(r"\+\d{1,3}-\d{7,15}", num_str):  # Match strict format
             cleaned_phones.append(num_str)
     phones = list(set(cleaned_phones))  # Remove duplicates
     
     return emails, phones
+    
 
 def extract_socials(html: str) -> Dict[str, Optional[str]]:
     res = {}
